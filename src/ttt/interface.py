@@ -3,10 +3,10 @@ import signal
 from abc import ABC
 from collections.abc import Coroutine, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from itertools import product
-from typing import Callable
+from typing import Any, Callable
 
 import pygame
 import structlog
@@ -38,9 +38,14 @@ class Event:
 
 
 @dataclass(frozen=True)
-class Element:
+class Eventable:
+    events: tuple[Event, ...] = tuple()
+
+
+@dataclass(frozen=True)
+class Element(Eventable):
     # the bounding box
-    position: pygame.Rect
+    position: pygame.Rect | None = None
 
     events: tuple[Event, ...] = tuple()
 
@@ -60,29 +65,29 @@ class CustomEvent(Enum):
 
 
 @dataclass
-class ElementOperation(ABC):
-    item: Element
+class DeltaOperation(ABC):
+    item: Any
 
 
 @dataclass
-class ElementAdd(ElementOperation):
+class DeltaAdd(DeltaOperation):
     pass
 
 
 @dataclass
-class ElementUpdate(ElementOperation):
-    new: Element
+class DeltaUpdate(DeltaOperation):
+    new: Any
 
 
 @dataclass
-class ElementDelete(ElementOperation):
+class DeltaDelete(DeltaOperation):
     pass
 
 
 @dataclass(frozen=True)
-class Application:
-    screen: pygame.Surface
-    clock: pygame.time.Clock
+class Application(Eventable):
+    screen: pygame.Surface = pygame.Surface((0, 0))
+    clock: pygame.time.Clock = pygame.time.Clock()
 
     elements: tuple[Element, ...] = tuple()
 
@@ -90,8 +95,51 @@ class Application:
 
     screen_update: asyncio.Queue[Element] = asyncio.Queue()
     state_update: asyncio.Queue[GameState] = asyncio.Queue()
-    element_delta: asyncio.Queue[ElementOperation] = asyncio.Queue()
+    event_delta: asyncio.Queue[DeltaOperation] = asyncio.Queue()
+    element_delta: asyncio.Queue[DeltaOperation] = asyncio.Queue()
     exit_event: asyncio.Event = asyncio.Event()
+
+
+def dispatch_application_handler(
+    application: Application,
+    event: pygame.event.Event,
+    checker: Callable[[Application, pygame.event.Event], bool] | None = None,
+):
+    for ev in application.events:
+        if not ev.kind == event.type:
+            continue
+        elif checker is None or checker(application, event):
+            asyncio.create_task(ev.handler(event, application, **event.detail))
+
+
+def dispatch_element_handler(
+    elements: tuple[Element, ...],
+    event: pygame.event.Event,
+    checker: Callable[[Element, pygame.event.Event], bool] | None = None,
+    **kwargs: Any,
+):
+    for element in elements:
+        for ev in element.events:
+            if not ev.kind == event.type:
+                continue
+            elif checker is None or checker(element, event):
+                asyncio.create_task(
+                    ev.handler(
+                        event,
+                        element,
+                        **dict(
+                            event.detail if hasattr(event, "detail") else {}, **kwargs
+                        ),
+                    )
+                )
+
+
+def check_is_collide(element: Element, event: pygame.event.Event) -> bool:
+    assert isinstance(element.position, pygame.Rect)
+
+    mouse_x, mouse_y = event.pos
+
+    return element.position.collidepoint(mouse_x, mouse_y)
 
 
 async def handle_events(
@@ -105,23 +153,22 @@ async def handle_events(
                 application.exit_event.set()
 
             case pygame.MOUSEBUTTONDOWN:
-                mouse_x, mouse_y = event.pos
+                dispatch_application_handler(application, event)
+                dispatch_element_handler(
+                    application.elements,
+                    event,
+                    check_is_collide,
+                    application=application,
+                    logger=logger,
+                )
 
-                for element in application.elements:
-                    for ev in element.events:
-                        if not ev.kind == event.type:
-                            continue
-
-                        if element.position.collidepoint(mouse_x, mouse_y):
-                            asyncio.create_task(
-                                ev.handler(ev.kind, element, application, logger)
-                            )
-
-            case CustomEvent.START.value:
-                asyncio.create_task(application.state_update.put(GameState.RING))
-
-            case CustomEvent.SWITCH.value:
-                asyncio.create_task(application.state_update.put(event.to))
+            case (
+                CustomEvent.START.value
+                | CustomEvent.SWITCH.value
+                | CustomEvent.RESET.value
+            ):
+                dispatch_application_handler(application, event)
+                dispatch_element_handler(application.elements, event)
 
             # case _:
             #    await logger.aerror("Unhandled event", pygame_event=event)
@@ -140,20 +187,14 @@ async def draw_box(
 
     pygame.draw.rect(application.screen, (255, 255, 255), position)
 
-    element = Box(
-        position,
-        column=column,
-        row=row,
-    )
-    await application.screen_update.put(element)
-
-    return element
+    return Box(position=position, column=column, row=row)
 
 
 async def redraw_box(
     application: Application, box: Box, value: Symbol, logger: BoundLogger
 ) -> Box:
-    # draw the base
+    assert isinstance(box.position, pygame.Rect)
+
     pygame.draw.rect(application.screen, (255, 255, 255), box.position)
 
     match value:
@@ -186,121 +227,144 @@ async def redraw_box(
                 PEN_WIDTH,
             )
 
-    element = Box(box.position, box.events, box.column, box.row, value)
-
-    await application.screen_update.put(element)
-
-    return element
+    return replace(box, value=value)
 
 
 async def handle_box_click(
-    _kind: int,
+    _event: pygame.event.Event,
     target: Box,
-    application: Application,
-    logger: BoundLogger,
+    **detail: Any,
 ) -> None:
-    match application.state:
+    match detail["application"].state:
         case GameState.INIT:
-            await logger.aerror("Game is not started")
+            await detail["logger"].aerror("Game is not started")
 
         case GameState.WINNER | GameState.TIE:
             pygame.event.post(pygame.event.Event(CustomEvent.RESET.value))
 
         case GameState.RING if target.value == Symbol.EMPTY:
-            await application.element_delta.put(
-                ElementUpdate(
-                    target, await redraw_box(application, target, Symbol.RING, logger)
-                )
+            element = await redraw_box(
+                detail["application"], target, Symbol.RING, detail["logger"]
             )
+            await detail["application"].element_delta.put(DeltaUpdate(target, element))
+            await screen_update(detail["application"], element)
 
             pygame.event.post(
-                pygame.event.Event(CustomEvent.SWITCH.value, to=GameState.CROSS)
+                pygame.event.Event(
+                    CustomEvent.SWITCH.value, detail={"to": GameState.CROSS}
+                )
             )
 
         case GameState.CROSS if target.value == Symbol.EMPTY:
-            await application.element_delta.put(
-                ElementUpdate(
-                    target,
-                    await redraw_box(application, target, Symbol.CROSS, logger),
+            element = await redraw_box(
+                detail["application"], target, Symbol.CROSS, detail["logger"]
+            )
+            await detail["application"].element_delta.put(DeltaUpdate(target, element))
+            await screen_update(detail["application"], element)
+
+            pygame.event.post(
+                pygame.event.Event(
+                    CustomEvent.SWITCH.value, detail={"to": GameState.RING}
                 )
             )
 
-            pygame.event.post(
-                pygame.event.Event(CustomEvent.SWITCH.value, to=GameState.RING)
-            )
-
         case _:
-            await logger.aerror("Invalid click")
+            await detail["logger"].aerror("Invalid click")
+
+
+async def handle_switch(_event: pygame.event.Event, target: Application, **detail: Any):
+    await target.state_update.put(detail["to"])
+
+
+async def handle_start(_event: pygame.event.Event, target: Application, **detail: Any):
+    await target.state_update.put(detail["start"])
+
+
+async def handle_init(_event: pygame.event.Event, target: Application, **detail: Any):
+    for row, col in product(range(3), range(3)):
+        element = await draw_box(target, row, col, 100, detail["logger"])
+        element = await add_event_listener(
+            element,
+            pygame.MOUSEBUTTONDOWN,
+            handle_box_click,
+        )
+        await target.element_delta.put(DeltaAdd(element))
+        await screen_update(target, element)  # type: ignore
+
+    pygame.event.post(
+        pygame.event.Event(CustomEvent.START.value, detail={"start": GameState.RING})
+    )
 
 
 async def setup(logger: BoundLogger) -> Application:
     pygame.init()
 
     application = Application(
-        pygame.display.set_mode((300, 300), pygame.NOFRAME),
-        pygame.time.Clock(),
+        screen=pygame.display.set_mode((300, 300), pygame.NOFRAME),
     )
+    application = await add_event_listener(
+        application, CustomEvent.SWITCH.value, handle_switch
+    )
+    application = await add_event_listener(
+        application, CustomEvent.START.value, handle_start
+    )
+    application = await add_event_listener(
+        application, CustomEvent.RESET.value, handle_init
+    )
+
+    assert isinstance(application, Application)
 
     shutdown_handler = ShutdownHandler(application.exit_event, logger)
     for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
         asyncio.get_event_loop().add_signal_handler(s, shutdown_handler)
 
-    return application
-
-
-async def init(application: Application, logger: BoundLogger):
-    logger.info("Drawing the initial grid")
-
-    for row, col in product(range(3), range(3)):
-        element = await draw_box(application, row, col, 100, logger)
-        await application.element_delta.put(
-            ElementAdd(
-                Box(
-                    element.position,
-                    element.events + (Event(pygame.MOUSEBUTTONDOWN, handle_box_click),),
-                    element.column,
-                    element.row,
-                    element.value,
-                )
-            )
-        )
+    return application  # type: ignore
 
 
 async def application_refresh(application: Application) -> Application:
-    with suppress(asyncio.queues.QueueEmpty):
-        elements = application.elements
-
-        while delta := application.element_delta.get_nowait():
-            match delta:
-                case ElementAdd():
-                    elements += (delta.item,)
-
-                case ElementUpdate():
-                    elements = tuple(
-                        delta.new if element == delta.item else element
-                        for element in elements
-                    )
-
-                case ElementDelete():
-                    elements = tuple(
-                        element for element in elements if not element == delta.item
-                    )
-
-    with suppress(asyncio.queues.QueueEmpty):
-        state = application.state
-
-        while state_new := application.state_update.get_nowait():
-            state = state_new
-
-    return Application(
-        application.screen,
-        application.clock,
-        elements,
-        state,
-        application.screen_update,
-        application.state_update,
-        application.element_delta,
+    return replace(
+        application,
+        elements=delta_queue_process(application.elements, application.element_delta),
+        state=state_queue_process(application.state, application.state_update),
+        events=delta_queue_process(application.events, application.event_delta),
     )
+
+
+def state_queue_process(
+    current: GameState, state_queue: asyncio.Queue[GameState]
+) -> GameState:
+    with suppress(asyncio.queues.QueueEmpty):
+        result = current
+
+        while state_new := state_queue.get_nowait():
+            result = state_new
+
+    return result
+
+
+def delta_queue_process(
+    target_list: tuple[Any, ...], delta_queue: asyncio.Queue[Any]
+) -> tuple[Any, ...]:
+    with suppress(asyncio.queues.QueueEmpty):
+        result = tuple(element for element in target_list)
+
+        while delta := delta_queue.get_nowait():
+            match delta:
+                case DeltaAdd():
+                    result += (delta.item,)
+
+                case DeltaUpdate():
+                    result = tuple(
+                        delta.new if element == delta.item else element
+                        for element in target_list
+                    )
+
+                case DeltaDelete():
+                    result = tuple(
+                        element for element in target_list if not element == delta.item
+                    )
+
+    return result
 
 
 @dataclass
@@ -319,20 +383,20 @@ async def run() -> None:
     await logger.ainfo("Initializing interface")
     application = await setup(logger)
 
-    await init(application, logger)
-
-    pygame.event.post(pygame.event.Event(CustomEvent.START.value))
+    pygame.event.post(
+        pygame.event.Event(CustomEvent.RESET.value, detail={"logger": logger})
+    )
 
     await logger.ainfo(
         f"Display surface size reported by Pygame: {application.screen.get_size()}"
     )
 
     while not application.exit_event.is_set():
+        application = await application_refresh(application)
+
         application.clock.tick(10)
 
         asyncio.create_task(handle_events(application, pygame.event.get(), logger))
-
-        application = await application_refresh(application)
 
         with suppress(asyncio.queues.QueueEmpty):
             while element := application.screen_update.get_nowait():
@@ -342,3 +406,26 @@ async def run() -> None:
 
     await logger.ainfo("Exiting interface")
     pygame.quit()
+
+
+async def add_event_listener(target: Eventable, kind: int, handler) -> Eventable:
+    event = Event(kind, handler)
+    result = target
+
+    match target:
+        case Application():
+            await target.event_delta.put(DeltaAdd(event))
+
+        case Element():
+            result = replace(target, events=target.events + (event,))
+
+        case _:
+            raise Exception("Unhandled event registration")
+
+    return result
+
+
+async def screen_update(application: Application, element: Element) -> Application:
+    await application.screen_update.put(element)
+
+    return application
