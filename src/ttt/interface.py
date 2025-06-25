@@ -13,6 +13,16 @@ import structlog
 from structlog.stdlib import BoundLogger
 
 
+@dataclass
+class ShutdownHandler:
+    exit_event: asyncio.Event
+    logger: BoundLogger
+
+    def __call__(self) -> None:
+        self.logger.info("Sending exit event")
+        self.exit_event.set()
+
+
 class Symbol(Enum):
     CROSS = auto()
     RING = auto()
@@ -142,7 +152,7 @@ def check_is_collide(element: Element, event: pygame.event.Event) -> bool:
     return element.position.collidepoint(mouse_x, mouse_y)
 
 
-async def handle_events(
+async def events_dispatch(
     application: Application,
     events: Sequence[pygame.event.Event],
     logger: BoundLogger,
@@ -179,10 +189,7 @@ async def draw_box(
     row: int,
     column: int,
     size: int,
-    logger: BoundLogger,
 ) -> Box:
-    logger.info("Drawing a box")
-
     position = pygame.Rect(column * size, row * size, size, size)
 
     pygame.draw.rect(application.screen, (255, 255, 255), position)
@@ -282,7 +289,7 @@ async def handle_start(_event: pygame.event.Event, target: Application, **detail
 
 async def handle_init(_event: pygame.event.Event, target: Application, **detail: Any):
     for row, col in product(range(3), range(3)):
-        element = await draw_box(target, row, col, 100, detail["logger"])
+        element = await draw_box(target, row, col, 100)
         element = await add_event_listener(
             element,
             pygame.MOUSEBUTTONDOWN,
@@ -297,8 +304,6 @@ async def handle_init(_event: pygame.event.Event, target: Application, **detail:
 
 
 async def setup(logger: BoundLogger) -> Application:
-    pygame.init()
-
     application = Application(
         screen=pygame.display.set_mode((300, 300), pygame.NOFRAME),
     )
@@ -367,17 +372,37 @@ def delta_queue_process(
     return result
 
 
-@dataclass
-class ShutdownHandler:
-    exit_event: asyncio.Event
-    logger: BoundLogger
+async def coroutine_loop(func, *args: Any):
+    with suppress(asyncio.CancelledError):
+        while args := await func(*args):
+            await asyncio.sleep(0)
 
-    def __call__(self) -> None:
-        self.logger.info("Sending exit event")
-        self.exit_event.set()
+
+async def display_update(screen_update: asyncio.Queue, clock: pygame.time.Clock):
+    clock.tick(60)
+
+    with suppress(asyncio.queues.QueueEmpty):
+        while element := screen_update.get_nowait():
+            pygame.display.update(element.position)
+
+    return screen_update, clock
+
+
+async def events_process(application: Application, logger: BoundLogger):
+    application = await application_refresh(application)
+
+    await events_dispatch(
+        application,
+        pygame.event.get(),
+        logger,
+    )
+
+    return application, logger
 
 
 async def run() -> None:
+    pygame.init()
+
     logger = structlog.get_logger().bind(module=__name__)
 
     await logger.ainfo("Initializing interface")
@@ -387,22 +412,29 @@ async def run() -> None:
         pygame.event.Event(CustomEvent.RESET.value, detail={"logger": logger})
     )
 
-    await logger.ainfo(
-        f"Display surface size reported by Pygame: {application.screen.get_size()}"
+    tasks = []
+
+    await logger.ainfo("Setting up display update loop")
+    tasks.append(
+        asyncio.create_task(
+            coroutine_loop(
+                display_update,
+                application.screen_update,
+                application.clock,
+            )
+        )
     )
 
-    while not application.exit_event.is_set():
-        application = await application_refresh(application)
+    await logger.ainfo("Setting up event dispatching loop")
+    tasks.append(
+        asyncio.create_task(coroutine_loop(events_process, application, logger))
+    )
 
-        application.clock.tick(10)
+    await application.exit_event.wait()
 
-        asyncio.create_task(handle_events(application, pygame.event.get(), logger))
-
-        with suppress(asyncio.queues.QueueEmpty):
-            while element := application.screen_update.get_nowait():
-                pygame.display.update(element.position)
-
-        await asyncio.sleep(0)
+    await logger.ainfo("Shutting down background tasks")
+    for task in tasks:
+        task.cancel()
 
     await logger.ainfo("Exiting interface")
     pygame.quit()
