@@ -1,7 +1,7 @@
 import asyncio
 import signal
 from abc import ABC
-from collections.abc import Coroutine, Sequence
+from collections.abc import Awaitable, Coroutine, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from enum import Enum, auto
@@ -372,23 +372,30 @@ def delta_queue_process(
     return result
 
 
-async def coroutine_loop(func, *args: Any):
+async def coroutine_loop(
+    func: Callable[..., Awaitable[Any | None]], *args: Any
+) -> None:
     with suppress(asyncio.CancelledError):
-        while args := await func(*args):
+        while True:
+            if returns := await func(*args):
+                args = returns
+
             await asyncio.sleep(0)
 
 
-async def display_update(screen_update: asyncio.Queue, clock: pygame.time.Clock):
+async def display_update(
+    screen_update: asyncio.Queue, clock: pygame.time.Clock
+) -> None:
     clock.tick(60)
 
     with suppress(asyncio.queues.QueueEmpty):
         while element := screen_update.get_nowait():
             pygame.display.update(element.position)
 
-    return screen_update, clock
 
-
-async def events_process(application: Application, logger: BoundLogger):
+async def events_process(
+    application: Application, logger: BoundLogger
+) -> tuple[Application, BoundLogger]:
     application = await application_refresh(application)
 
     await events_dispatch(
