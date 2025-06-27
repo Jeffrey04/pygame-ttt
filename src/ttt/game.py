@@ -26,6 +26,19 @@ from ttt.core import (
 
 PEN_WIDTH = 5
 BOX_PADDING = 5
+WIN_LINES = [
+    # Rows
+    {(0, 0), (0, 1), (0, 2)},
+    {(1, 0), (1, 1), (1, 2)},
+    {(2, 0), (2, 1), (2, 2)},
+    # Columns
+    {(0, 0), (1, 0), (2, 0)},
+    {(0, 1), (1, 1), (2, 1)},
+    {(0, 2), (1, 2), (2, 2)},
+    # Diagonals
+    {(0, 0), (1, 1), (2, 2)},
+    {(0, 2), (1, 1), (2, 0)},
+]
 
 
 class Symbol(Enum):
@@ -175,7 +188,11 @@ async def handle_box_click(
             await detail["logger"].aerror("Invalid click")
 
     if element:
-        pygame.event.post(pygame.event.Event(CustomEvent.UPDATEMAP.value))
+        pygame.event.post(
+            pygame.event.Event(
+                CustomEvent.UPDATEMAP.value, detail={"logger": detail["logger"]}
+            )
+        )
 
 
 async def handle_update(_event: pygame.event.Event, target: Application, **detail: Any):
@@ -191,50 +208,31 @@ async def handle_update(_event: pygame.event.Event, target: Application, **detai
         ),
     )
 
-    pygame.event.post(pygame.event.Event(CustomEvent.JUDGE.value))
+    pygame.event.post(
+        pygame.event.Event(CustomEvent.JUDGE.value, detail={"logger": detail["logger"]})
+    )
 
 
 async def handle_judge(_event: pygame.event.Event, target: Application, **detail: Any):
     if not (bmap := state_get(target, "board").get("map")):
         return
 
-    tiles = ()
-    winner = None
-    downdiag = {(0, 0), (1, 1), (2, 2)}
-    updiag = {(0, 2), (1, 1), (2, 0)}
+    tiles, winner = (), None
 
     for symbol in (Symbol.RING, Symbol.CROSS):
         places = {coor for coor, item in bmap.mapping.items() if symbol == item}
 
-        if len(places & downdiag) == 3:
-            tiles = downdiag
-            winner = symbol
-            break
-
-        if len(places & updiag) == 3:
-            tiles = updiag
-            winner = symbol
-            break
-
-        for col, count in Counter(tuple(col for (col, _) in places)).items():
-            if count == 3:
-                tiles = {(col, row) for row in range(3)}
+        for line in WIN_LINES:
+            if line.issubset(places):
                 winner = symbol
+                tiles = line
                 break
 
-        if tiles:
-            break
-
-        for row, count in Counter(tuple(row for (_, row) in places)).items():
-            if count == 3:
-                tiles = {(col, row) for col in range(3)}
-                winner = symbol
-                break
-
-        if tiles:
+        if winner:
             break
 
     if winner:
+        await detail["logger"].ainfo("Winner is found", winner=winner)
         await state_merge(target, "board", winner=winner, state=GameState.END)
 
         for element in target.elements:
@@ -251,6 +249,7 @@ async def handle_judge(_event: pygame.event.Event, target: Application, **detail
         len([symbol for _, symbol in bmap.mapping.items() if symbol == Symbol.EMPTY])
         == 0
     ):
+        await detail["logger"].ainfo("End with a tie")
         await state_merge(target, "board", state=GameState.TIE)
 
 

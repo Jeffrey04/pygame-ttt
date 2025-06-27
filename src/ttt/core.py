@@ -371,5 +371,5 @@ async def state_merge(application: Application, key: str, **kwargs: Any):
     )
 
 
-def state_get(application, key) -> frozendict[str, Any]:
+def state_get(application: Application, key: str) -> frozendict[str, Any]:
     return application.state.get(key, frozendict())
