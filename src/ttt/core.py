@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 import pygame
 import structlog
+from frozendict import frozendict
 from structlog.stdlib import BoundLogger
 
 
@@ -43,6 +44,7 @@ class Element(Eventable):
 class SystemEvent(Enum):
     INIT = pygame.event.custom_type()
     EXIT = pygame.event.custom_type()
+    REFRESH = pygame.event.custom_type()
 
 
 class ApplicationDataField(Enum):
@@ -77,10 +79,15 @@ class DeltaReplace(DeltaOperation):
     pass
 
 
+@dataclass
+class DeltaMerge(DeltaOperation):
+    key: str
+
+
 @dataclass(frozen=True)
 class Application(Eventable):
     screen: pygame.Surface = pygame.Surface((0, 0))
-    state: Any = None
+    state: frozendict[str, frozendict[str, Any]] = frozendict()
     clock: pygame.time.Clock = pygame.time.Clock()
 
     elements: tuple[Element, ...] = tuple()
@@ -94,12 +101,19 @@ def dispatch_application_handler(
     application: Application,
     event: pygame.event.Event,
     checker: Callable[[Application, pygame.event.Event], bool] | None = None,
+    **kwargs: Any,
 ):
     for ev in application.events:
         if not ev.kind == event.type:
             continue
         elif checker is None or checker(application, event):
-            asyncio.create_task(ev.handler(event, application, **event.detail))
+            asyncio.create_task(
+                ev.handler(
+                    event,
+                    application,
+                    **dict(event.detail if hasattr(event, "detail") else {}, **kwargs),
+                )
+            )
 
 
 def dispatch_element_handler(
@@ -185,7 +199,7 @@ async def display_update(
     pygame.display.update(updates)
 
 
-def application_get_field(application, field: ApplicationDataField) -> str:
+def application_get_field(application: Application, field: ApplicationDataField) -> str:
     result = None
 
     match field:
@@ -246,6 +260,22 @@ async def application_refresh(application: Application) -> Application:
                 case DeltaReplace():
                     result = replace(result, **{field: delta.item})
 
+                case DeltaMerge():
+                    result = replace(
+                        result,
+                        **{
+                            field: getattr(result, field)
+                            | frozendict(
+                                **{
+                                    delta.key: getattr(result, field).get(
+                                        delta.key, frozendict()
+                                    )
+                                    | frozendict(**delta.item)
+                                }
+                            )
+                        },
+                    )
+
     return result
 
 
@@ -254,6 +284,10 @@ async def events_process(
     logger: BoundLogger,
 ) -> tuple[Application, BoundLogger]:
     application = await application_refresh(application)
+
+    pygame.event.post(
+        pygame.event.Event(SystemEvent.REFRESH.value, detail={"logger": logger})
+    )
 
     await events_dispatch(
         application,
@@ -329,3 +363,13 @@ async def screen_update(application: Application, element: Element) -> Applicati
     await application.delta_screen.put(element)
 
     return application
+
+
+async def state_merge(application: Application, key: str, **kwargs: Any):
+    await application.delta_data.put(
+        DeltaMerge(ApplicationDataField.STATE, kwargs, key)
+    )
+
+
+def state_get(application, key) -> frozendict[str, Any]:
+    return application.state.get(key, frozendict())

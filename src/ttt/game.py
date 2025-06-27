@@ -3,7 +3,7 @@ import signal
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from itertools import product
-from typing import Any
+from typing import Any, Counter
 
 import pygame
 import structlog
@@ -13,7 +13,6 @@ from ttt.core import (
     Application,
     ApplicationDataField,
     DeltaAdd,
-    DeltaReplace,
     DeltaUpdate,
     Element,
     ShutdownHandler,
@@ -21,6 +20,8 @@ from ttt.core import (
     add_event_listener,
     main_loop,
     screen_update,
+    state_get,
+    state_merge,
 )
 
 PEN_WIDTH = 5
@@ -44,7 +45,7 @@ class GameState(Enum):
     INIT = auto()
     CROSS = auto()
     RING = auto()
-    WINNER = auto()
+    END = auto()
     TIE = auto()
 
 
@@ -53,6 +54,13 @@ class CustomEvent(Enum):
     START = pygame.event.custom_type()
     SWITCH = pygame.event.custom_type()
     END = pygame.event.custom_type()
+    UPDATEMAP = pygame.event.custom_type()
+    JUDGE = pygame.event.custom_type()
+
+
+@dataclass
+class BoardMap:
+    mapping: dict[tuple[int, int], Symbol]
 
 
 async def draw_box(
@@ -69,13 +77,11 @@ async def draw_box(
 
 
 async def handle_switch(_event: pygame.event.Event, target: Application, **detail: Any):
-    await target.delta_data.put(DeltaReplace(ApplicationDataField.STATE, detail["to"]))
+    await state_merge(target, "board", state=detail["to"])
 
 
 async def handle_start(_event: pygame.event.Event, target: Application, **detail: Any):
-    await target.delta_data.put(
-        DeltaReplace(ApplicationDataField.STATE, detail["start"])
-    )
+    await state_merge(target, "board", state=detail["start"])
 
 
 async def handle_init(_event: pygame.event.Event, target: Application, **detail: Any):
@@ -93,22 +99,48 @@ async def handle_init(_event: pygame.event.Event, target: Application, **detail:
         pygame.event.Event(CustomEvent.START.value, detail={"start": GameState.RING})
     )
 
+async def handle_reset(_event: pygame.event.Event, target: Application, **detail: Any):
+    await state_merge(
+        target, "board", winner=None, state=GameState.END, board=BoardMap({})
+    )
+
+    for element in target.elements:
+        delta = await redraw_box(target, (255, 255, 255), element, Symbol.EMPTY)  # type: ignore
+        await target.delta_data.put(
+            DeltaUpdate(ApplicationDataField.ELEMENTS, element, delta)
+        )
+        await screen_update(target, delta)
+
+    pygame.event.post(
+        pygame.event.Event(CustomEvent.START.value, detail={"start": GameState.RING})
+    )
+
 
 async def handle_box_click(
     _event: pygame.event.Event,
     target: Box,
     **detail: Any,
 ) -> None:
-    match detail["application"].state:
+    element = None
+
+    match state_get(detail["application"], "board").get("state"):
         case GameState.INIT:
             await detail["logger"].aerror("Game is not started")
 
-        case GameState.WINNER | GameState.TIE:
+        case GameState.END:
+            await detail["logger"].ainfo("END")
+            pygame.event.post(pygame.event.Event(CustomEvent.RESET.value))
+
+        case GameState.TIE:
+            await detail["logger"].ainfo("TIE")
             pygame.event.post(pygame.event.Event(CustomEvent.RESET.value))
 
         case GameState.RING if target.value == Symbol.EMPTY:
             element = await redraw_box(
-                detail["application"], target, Symbol.RING, detail["logger"]
+                detail["application"],
+                (255, 255, 255),
+                target,
+                Symbol.RING,
             )
             await detail["application"].delta_data.put(
                 DeltaUpdate(ApplicationDataField.ELEMENTS, target, element)
@@ -123,7 +155,10 @@ async def handle_box_click(
 
         case GameState.CROSS if target.value == Symbol.EMPTY:
             element = await redraw_box(
-                detail["application"], target, Symbol.CROSS, detail["logger"]
+                detail["application"],
+                (255, 255, 255),
+                target,
+                Symbol.CROSS,
             )
             await detail["application"].delta_data.put(
                 DeltaUpdate(ApplicationDataField.ELEMENTS, target, element)
@@ -139,13 +174,95 @@ async def handle_box_click(
         case _:
             await detail["logger"].aerror("Invalid click")
 
+    if element:
+        pygame.event.post(pygame.event.Event(CustomEvent.UPDATEMAP.value))
+
+
+async def handle_update(_event: pygame.event.Event, target: Application, **detail: Any):
+    await state_merge(
+        target,
+        "board",
+        map=BoardMap(
+            {
+                (item.column, item.row): item.value
+                for item in target.elements
+                if isinstance(item, Box)
+            }
+        ),
+    )
+
+    pygame.event.post(pygame.event.Event(CustomEvent.JUDGE.value))
+
+
+async def handle_judge(_event: pygame.event.Event, target: Application, **detail: Any):
+    if not (bmap := state_get(target, "board").get("map")):
+        return
+
+    tiles = ()
+    winner = None
+    downdiag = {(0, 0), (1, 1), (2, 2)}
+    updiag = {(0, 2), (1, 1), (2, 0)}
+
+    for symbol in (Symbol.RING, Symbol.CROSS):
+        places = {coor for coor, item in bmap.mapping.items() if symbol == item}
+
+        if len(places & downdiag) == 3:
+            tiles = downdiag
+            winner = symbol
+            break
+
+        if len(places & updiag) == 3:
+            tiles = updiag
+            winner = symbol
+            break
+
+        for col, count in Counter(tuple(col for (col, _) in places)).items():
+            if count == 3:
+                tiles = {(col, row) for row in range(3)}
+                winner = symbol
+                break
+
+        if tiles:
+            break
+
+        for row, count in Counter(tuple(row for (_, row) in places)).items():
+            if count == 3:
+                tiles = {(col, row) for col in range(3)}
+                winner = symbol
+                break
+
+        if tiles:
+            break
+
+    if winner:
+        await state_merge(target, "board", winner=winner, state=GameState.END)
+
+        for element in target.elements:
+            if (element.column, element.row) in tiles:  # type: ignore
+                delta = await redraw_box(target, (255, 255, 0), element, winner)  # type: ignore
+                await target.delta_data.put(
+                    DeltaUpdate(ApplicationDataField.ELEMENTS, element, delta)
+                )
+                await screen_update(
+                    target,
+                    delta,  # type: ignore
+                )
+    elif (
+        len([symbol for _, symbol in bmap.mapping.items() if symbol == Symbol.EMPTY])
+        == 0
+    ):
+        await state_merge(target, "board", state=GameState.TIE)
+
 
 async def redraw_box(
-    application: Application, box: Box, value: Symbol, logger: BoundLogger
+    application: Application,
+    color: tuple[int, int, int],
+    box: Box,
+    value: Symbol,
 ) -> Box:
     assert isinstance(box.position, pygame.Rect)
 
-    pygame.draw.rect(application.screen, (255, 255, 255), box.position)
+    pygame.draw.rect(application.screen, color, box.position)
 
     match value:
         case Symbol.RING:
@@ -182,7 +299,7 @@ async def redraw_box(
 
 async def setup(logger: BoundLogger) -> Application:
     application = Application(
-        screen=pygame.display.set_mode((300, 300), pygame.NOFRAME),
+        screen=pygame.display.set_mode((300, 300), pygame.NOFRAME)
     )
     application = await add_event_listener(
         application, CustomEvent.SWITCH.value, handle_switch
@@ -191,10 +308,16 @@ async def setup(logger: BoundLogger) -> Application:
         application, CustomEvent.START.value, handle_start
     )
     application = await add_event_listener(
-        application, CustomEvent.RESET.value, handle_init
+        application, SystemEvent.INIT.value, handle_init
     )
     application = await add_event_listener(
-        application, SystemEvent.INIT.value, handle_init
+        application, CustomEvent.RESET.value, handle_reset
+    )
+    application = await add_event_listener(
+        application, CustomEvent.UPDATEMAP.value, handle_update
+    )
+    application = await add_event_listener(
+        application, CustomEvent.JUDGE.value, handle_judge
     )
 
     assert isinstance(application, Application)
