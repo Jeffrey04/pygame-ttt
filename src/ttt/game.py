@@ -1,6 +1,5 @@
 import asyncio
 import signal
-from contextlib import suppress
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from itertools import product
@@ -12,13 +11,14 @@ from structlog.stdlib import BoundLogger
 
 from ttt.core import (
     Application,
+    ApplicationDataField,
     DeltaAdd,
+    DeltaReplace,
     DeltaUpdate,
     Element,
     ShutdownHandler,
     SystemEvent,
     add_event_listener,
-    delta_queue_process,
     main_loop,
     screen_update,
 )
@@ -55,15 +55,8 @@ class CustomEvent(Enum):
     END = pygame.event.custom_type()
 
 
-@dataclass(frozen=True)
-class Game(Application):
-    state: GameState = GameState.INIT
-
-    state_update: asyncio.Queue[GameState] = asyncio.Queue()
-
-
 async def draw_box(
-    application: Game,
+    application: Application,
     row: int,
     column: int,
     size: int,
@@ -75,15 +68,17 @@ async def draw_box(
     return Box(position=position, column=column, row=row)
 
 
-async def handle_switch(_event: pygame.event.Event, target: Game, **detail: Any):
-    await target.state_update.put(detail["to"])
+async def handle_switch(_event: pygame.event.Event, target: Application, **detail: Any):
+    await target.delta_data.put(DeltaReplace(ApplicationDataField.STATE, detail["to"]))
 
 
-async def handle_start(_event: pygame.event.Event, target: Game, **detail: Any):
-    await target.state_update.put(detail["start"])
+async def handle_start(_event: pygame.event.Event, target: Application, **detail: Any):
+    await target.delta_data.put(
+        DeltaReplace(ApplicationDataField.STATE, detail["start"])
+    )
 
 
-async def handle_init(_event: pygame.event.Event, target: Game, **detail: Any):
+async def handle_init(_event: pygame.event.Event, target: Application, **detail: Any):
     for row, col in product(range(3), range(3)):
         element = await draw_box(target, row, col, 100)
         element = await add_event_listener(
@@ -91,7 +86,7 @@ async def handle_init(_event: pygame.event.Event, target: Game, **detail: Any):
             pygame.MOUSEBUTTONDOWN,
             handle_box_click,
         )
-        await target.element_delta.put(DeltaAdd(element))
+        await target.delta_data.put(DeltaAdd(ApplicationDataField.ELEMENTS, element))
         await screen_update(target, element)  # type: ignore
 
     pygame.event.post(
@@ -115,7 +110,9 @@ async def handle_box_click(
             element = await redraw_box(
                 detail["application"], target, Symbol.RING, detail["logger"]
             )
-            await detail["application"].element_delta.put(DeltaUpdate(target, element))
+            await detail["application"].delta_data.put(
+                DeltaUpdate(ApplicationDataField.ELEMENTS, target, element)
+            )
             await screen_update(detail["application"], element)
 
             pygame.event.post(
@@ -128,7 +125,9 @@ async def handle_box_click(
             element = await redraw_box(
                 detail["application"], target, Symbol.CROSS, detail["logger"]
             )
-            await detail["application"].element_delta.put(DeltaUpdate(target, element))
+            await detail["application"].delta_data.put(
+                DeltaUpdate(ApplicationDataField.ELEMENTS, target, element)
+            )
             await screen_update(detail["application"], element)
 
             pygame.event.post(
@@ -142,7 +141,7 @@ async def handle_box_click(
 
 
 async def redraw_box(
-    application: Game, box: Box, value: Symbol, logger: BoundLogger
+    application: Application, box: Box, value: Symbol, logger: BoundLogger
 ) -> Box:
     assert isinstance(box.position, pygame.Rect)
 
@@ -181,8 +180,8 @@ async def redraw_box(
     return replace(box, value=value)
 
 
-async def setup(logger: BoundLogger) -> Game:
-    application = Game(
+async def setup(logger: BoundLogger) -> Application:
+    application = Application(
         screen=pygame.display.set_mode((300, 300), pygame.NOFRAME),
     )
     application = await add_event_listener(
@@ -198,7 +197,7 @@ async def setup(logger: BoundLogger) -> Game:
         application, SystemEvent.INIT.value, handle_init
     )
 
-    assert isinstance(application, Game)
+    assert isinstance(application, Application)
 
     shutdown_handler = ShutdownHandler(application.exit_event, logger)
     for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
@@ -207,28 +206,7 @@ async def setup(logger: BoundLogger) -> Game:
     return application  # type: ignore
 
 
-def state_queue_process(
-    current: GameState, state_queue: asyncio.Queue[GameState]
-) -> GameState:
-    with suppress(asyncio.queues.QueueEmpty):
-        result = current
-
-        while state_new := state_queue.get_nowait():
-            result = state_new
-
-    return result
-
-
-async def application_refresh(application: Game) -> Game:
-    return replace(
-        application,
-        elements=delta_queue_process(application.elements, application.element_delta),
-        state=state_queue_process(application.state, application.state_update),
-        events=delta_queue_process(application.events, application.event_delta),
-    )
-
-
 async def run() -> None:
     logger = structlog.get_logger().bind(module=__name__)
 
-    await main_loop(setup(logger), application_refresh)
+    await main_loop(setup(logger))

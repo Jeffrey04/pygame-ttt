@@ -1,7 +1,7 @@
 import asyncio
 
-from ttt import interface
+from ttt import game
 
 
 def main() -> None:
-    asyncio.run(interface.run())
+    asyncio.run(game.run())

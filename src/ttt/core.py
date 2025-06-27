@@ -3,7 +3,7 @@ from abc import ABC
 from collections.abc import Awaitable, Coroutine, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from enum import Enum
+from enum import Enum, auto
 from typing import Any, Callable
 
 import pygame
@@ -45,8 +45,15 @@ class SystemEvent(Enum):
     EXIT = pygame.event.custom_type()
 
 
+class ApplicationDataField(Enum):
+    STATE = auto()
+    ELEMENTS = auto()
+    EVENTS = auto()
+
+
 @dataclass
 class DeltaOperation(ABC):
+    field: ApplicationDataField
     item: Any
 
 
@@ -65,16 +72,21 @@ class DeltaDelete(DeltaOperation):
     pass
 
 
+@dataclass
+class DeltaReplace(DeltaOperation):
+    pass
+
+
 @dataclass(frozen=True)
 class Application(Eventable):
     screen: pygame.Surface = pygame.Surface((0, 0))
+    state: Any = None
     clock: pygame.time.Clock = pygame.time.Clock()
 
     elements: tuple[Element, ...] = tuple()
 
-    screen_update: asyncio.Queue[Element] = asyncio.Queue()
-    event_delta: asyncio.Queue[DeltaOperation] = asyncio.Queue()
-    element_delta: asyncio.Queue[DeltaOperation] = asyncio.Queue()
+    delta_data: asyncio.Queue[DeltaOperation] = asyncio.Queue()
+    delta_screen: asyncio.Queue[Element] = asyncio.Queue()
     exit_event: asyncio.Event = asyncio.Event()
 
 
@@ -148,31 +160,6 @@ async def events_dispatch(
             #    await logger.aerror("Unhandled event", pygame_event=event)
 
 
-def delta_queue_process(
-    target_list: tuple[Any, ...], delta_queue: asyncio.Queue[Any]
-) -> tuple[Any, ...]:
-    with suppress(asyncio.queues.QueueEmpty):
-        result = tuple(element for element in target_list)
-
-        while delta := delta_queue.get_nowait():
-            match delta:
-                case DeltaAdd():
-                    result += (delta.item,)
-
-                case DeltaUpdate():
-                    result = tuple(
-                        delta.new if element == delta.item else element
-                        for element in target_list
-                    )
-
-                case DeltaDelete():
-                    result = tuple(
-                        element for element in target_list if not element == delta.item
-                    )
-
-    return result
-
-
 async def coroutine_loop(
     func: Callable[..., Awaitable[Any | None]], *args: Any
 ) -> None:
@@ -198,12 +185,75 @@ async def display_update(
     pygame.display.update(updates)
 
 
+def application_get_field(application, field: ApplicationDataField) -> str:
+    result = None
+
+    match field:
+        case ApplicationDataField.EVENTS:
+            result = "events"
+
+        case ApplicationDataField.ELEMENTS:
+            result = "elements"
+
+        case ApplicationDataField.STATE:
+            result = "state"
+
+        case _:
+            raise Exception("Wrong data field")
+
+    assert hasattr(application, result)
+
+    return result
+
+
+async def application_refresh(application: Application) -> Application:
+    result = application
+
+    with suppress(asyncio.queues.QueueEmpty):
+        while delta := application.delta_data.get_nowait():
+            field = application_get_field(application, delta.field)
+
+            match delta:
+                case DeltaAdd():
+                    result = replace(
+                        result,
+                        **{field: getattr(result, field) + (delta.item,)},
+                    )
+
+                case DeltaUpdate():
+                    result = replace(
+                        result,
+                        **{
+                            field: tuple(
+                                delta.new if item == delta.item else item
+                                for item in getattr(result, field)
+                            )
+                        },
+                    )
+
+                case DeltaDelete():
+                    result = replace(
+                        result,
+                        **{
+                            field: tuple(
+                                item
+                                for item in getattr(result, field)
+                                if not item == delta.item
+                            )
+                        },
+                    )
+
+                case DeltaReplace():
+                    result = replace(result, **{field: delta.item})
+
+    return result
+
+
 async def events_process(
     application: Application,
-    refresher: Callable[[Application], Awaitable[Application]],
     logger: BoundLogger,
-) -> tuple[Application, Callable[[Application], Awaitable[Application]], BoundLogger]:
-    application = await refresher(application)
+) -> tuple[Application, BoundLogger]:
+    application = await application_refresh(application)
 
     await events_dispatch(
         application,
@@ -211,12 +261,11 @@ async def events_process(
         logger,
     )
 
-    return application, refresher, logger
+    return application, logger
 
 
 async def main_loop(
     application_setup: Awaitable[Application],
-    refresher: Callable[..., Awaitable[Application]],
 ) -> None:
     pygame.init()
 
@@ -236,7 +285,7 @@ async def main_loop(
         asyncio.create_task(
             coroutine_loop(
                 display_update,
-                application.screen_update,
+                application.delta_screen,
                 application.clock,
             )
         )
@@ -244,9 +293,7 @@ async def main_loop(
 
     await logger.ainfo("Setting up event dispatching loop")
     tasks.append(
-        asyncio.create_task(
-            coroutine_loop(events_process, application, refresher, logger)
-        )
+        asyncio.create_task(coroutine_loop(events_process, application, logger))
     )
 
     await application.exit_event.wait()
@@ -267,7 +314,7 @@ async def add_event_listener(
 
     match target:
         case Application():
-            await target.event_delta.put(DeltaAdd(event))
+            await target.delta_data.put(DeltaAdd(ApplicationDataField.EVENTS, event))
 
         case Element():
             result = replace(target, events=target.events + (event,))
@@ -279,6 +326,6 @@ async def add_event_listener(
 
 
 async def screen_update(application: Application, element: Element) -> Application:
-    await application.screen_update.put(element)
+    await application.delta_screen.put(element)
 
     return application
