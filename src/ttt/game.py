@@ -89,15 +89,21 @@ async def draw_box(
     return Box(position=position, column=column, row=row)
 
 
-async def handle_switch(_event: pygame.event.Event, target: Application, **detail: Any):
+async def handle_switch(
+    _event: pygame.event.Event, target: Application, logger: BoundLogger, **detail: Any
+):
     await state_merge(target, "board", state=detail["to"])
 
 
-async def handle_start(_event: pygame.event.Event, target: Application, **detail: Any):
+async def handle_start(
+    _event: pygame.event.Event, target: Application, logger: BoundLogger, **detail: Any
+):
     await state_merge(target, "board", state=detail["start"])
 
 
-async def handle_init(_event: pygame.event.Event, target: Application, **detail: Any):
+async def handle_init(
+    _event: pygame.event.Event, target: Application, logger: BoundLogger, **detail: Any
+):
     for row, col in product(range(3), range(3)):
         element = await draw_box(target, row, col, 100)
         element = await add_event_listener(
@@ -112,7 +118,9 @@ async def handle_init(_event: pygame.event.Event, target: Application, **detail:
         pygame.event.Event(CustomEvent.START.value, detail={"start": GameState.RING})
     )
 
-async def handle_reset(_event: pygame.event.Event, target: Application, **detail: Any):
+async def handle_reset(
+    _event: pygame.event.Event, target: Application, logger: BoundLogger, **detail: Any
+):
     await state_merge(
         target, "board", winner=None, state=GameState.END, board=BoardMap({})
     )
@@ -132,33 +140,35 @@ async def handle_reset(_event: pygame.event.Event, target: Application, **detail
 async def handle_box_click(
     _event: pygame.event.Event,
     target: Box,
+    application: Application,
+    logger: BoundLogger,
     **detail: Any,
 ) -> None:
     element = None
 
-    match state_get(detail["application"], "board").get("state"):
+    match state_get(application, "board").get("state"):
         case GameState.INIT:
-            await detail["logger"].aerror("Game is not started")
+            await logger.aerror("Game is not started")
 
         case GameState.END:
-            await detail["logger"].ainfo("END")
+            await logger.ainfo("END")
             pygame.event.post(pygame.event.Event(CustomEvent.RESET.value))
 
         case GameState.TIE:
-            await detail["logger"].ainfo("TIE")
+            await logger.ainfo("TIE")
             pygame.event.post(pygame.event.Event(CustomEvent.RESET.value))
 
         case GameState.RING if target.value == Symbol.EMPTY:
             element = await redraw_box(
-                detail["application"],
+                application,
                 (255, 255, 255),
                 target,
                 Symbol.RING,
             )
-            await detail["application"].delta_data.put(
+            await application.delta_data.put(
                 DeltaUpdate(ApplicationDataField.ELEMENTS, target, element)
             )
-            await screen_update(detail["application"], element)
+            await screen_update(application, element)
 
             pygame.event.post(
                 pygame.event.Event(
@@ -168,15 +178,15 @@ async def handle_box_click(
 
         case GameState.CROSS if target.value == Symbol.EMPTY:
             element = await redraw_box(
-                detail["application"],
+                application,
                 (255, 255, 255),
                 target,
                 Symbol.CROSS,
             )
-            await detail["application"].delta_data.put(
+            await application.delta_data.put(
                 DeltaUpdate(ApplicationDataField.ELEMENTS, target, element)
             )
-            await screen_update(detail["application"], element)
+            await screen_update(application, element)
 
             pygame.event.post(
                 pygame.event.Event(
@@ -185,17 +195,15 @@ async def handle_box_click(
             )
 
         case _:
-            await detail["logger"].aerror("Invalid click")
+            await logger.aerror("Invalid click")
 
     if element:
-        pygame.event.post(
-            pygame.event.Event(
-                CustomEvent.UPDATEMAP.value, detail={"logger": detail["logger"]}
-            )
-        )
+        pygame.event.post(pygame.event.Event(CustomEvent.UPDATEMAP.value))
 
 
-async def handle_update(_event: pygame.event.Event, target: Application, **detail: Any):
+async def handle_update(
+    _event: pygame.event.Event, target: Application, logger: BoundLogger, **detail: Any
+):
     await state_merge(
         target,
         "board",
@@ -208,12 +216,12 @@ async def handle_update(_event: pygame.event.Event, target: Application, **detai
         ),
     )
 
-    pygame.event.post(
-        pygame.event.Event(CustomEvent.JUDGE.value, detail={"logger": detail["logger"]})
-    )
+    pygame.event.post(pygame.event.Event(CustomEvent.JUDGE.value))
 
 
-async def handle_judge(_event: pygame.event.Event, target: Application, **detail: Any):
+async def handle_judge(
+    _event: pygame.event.Event, target: Application, logger: BoundLogger, **detail: Any
+):
     if not (bmap := state_get(target, "board").get("map")):
         return
 
@@ -232,7 +240,7 @@ async def handle_judge(_event: pygame.event.Event, target: Application, **detail
             break
 
     if winner:
-        await detail["logger"].ainfo("Winner is found", winner=winner)
+        await logger.ainfo("Winner is found", winner=winner)
         await state_merge(target, "board", winner=winner, state=GameState.END)
 
         for element in target.elements:
@@ -249,7 +257,7 @@ async def handle_judge(_event: pygame.event.Event, target: Application, **detail
         len([symbol for _, symbol in bmap.mapping.items() if symbol == Symbol.EMPTY])
         == 0
     ):
-        await detail["logger"].ainfo("End with a tie")
+        await logger.ainfo("End with a tie")
         await state_merge(target, "board", state=GameState.TIE)
 
 

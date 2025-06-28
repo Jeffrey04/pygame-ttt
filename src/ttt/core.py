@@ -45,6 +45,7 @@ class SystemEvent(Enum):
     INIT = pygame.event.custom_type()
     EXIT = pygame.event.custom_type()
     REFRESH = pygame.event.custom_type()
+    FRAME_NEXT = pygame.event.custom_type()
 
 
 class ApplicationDataField(Enum):
@@ -100,8 +101,8 @@ class Application(Eventable):
 def dispatch_application_handler(
     application: Application,
     event: pygame.event.Event,
+    logger: BoundLogger,
     checker: Callable[[Application, pygame.event.Event], bool] | None = None,
-    **kwargs: Any,
 ):
     for ev in application.events:
         if not ev.kind == event.type:
@@ -111,7 +112,8 @@ def dispatch_application_handler(
                 ev.handler(
                     event,
                     application,
-                    **dict(event.detail if hasattr(event, "detail") else {}, **kwargs),
+                    logger,
+                    **dict(event.detail if hasattr(event, "detail") else {}),
                 )
             )
 
@@ -119,8 +121,9 @@ def dispatch_application_handler(
 def dispatch_element_handler(
     elements: tuple[Element, ...],
     event: pygame.event.Event,
+    application: Application,
+    logger: BoundLogger,
     checker: Callable[[Element, pygame.event.Event], bool] | None = None,
-    **kwargs: Any,
 ):
     for element in elements:
         for ev in element.events:
@@ -131,9 +134,9 @@ def dispatch_element_handler(
                     ev.handler(
                         event,
                         element,
-                        **dict(
-                            event.detail if hasattr(event, "detail") else {}, **kwargs
-                        ),
+                        application,
+                        logger,
+                        **dict(event.detail if hasattr(event, "detail") else {}),
                     )
                 )
 
@@ -157,18 +160,23 @@ async def events_dispatch(
                 application.exit_event.set()
 
             case pygame.MOUSEBUTTONDOWN:
-                dispatch_application_handler(application, event)
+                dispatch_application_handler(application, event, logger)
                 dispatch_element_handler(
                     application.elements,
                     event,
+                    application,
+                    logger,
                     check_is_collide,
-                    application=application,
-                    logger=logger,
                 )
 
             case custom if custom >= pygame.USEREVENT:
-                dispatch_application_handler(application, event)
-                dispatch_element_handler(application.elements, event)
+                dispatch_application_handler(application, event, logger)
+                dispatch_element_handler(
+                    application.elements,
+                    event,
+                    application,
+                    logger,
+                )
 
             # case _:
             #    await logger.aerror("Unhandled event", pygame_event=event)
@@ -179,8 +187,11 @@ async def coroutine_loop(
 ) -> None:
     with suppress(asyncio.CancelledError):
         while True:
-            if returns := await func(*args):
-                args = returns
+            try:
+                if returns := await func(*args):
+                    args = returns
+            except Exception as e:
+                print(e)
 
             await asyncio.sleep(0)
 
@@ -197,6 +208,8 @@ async def display_update(
             updates.append(element.position)
 
     pygame.display.update(updates)
+
+    pygame.event.post(pygame.event.Event(SystemEvent.FRAME_NEXT.value))
 
 
 def application_get_field(application: Application, field: ApplicationDataField) -> str:
@@ -308,9 +321,7 @@ async def main_loop(
     await logger.ainfo("Initializing interface")
     application = await application_setup
 
-    pygame.event.post(
-        pygame.event.Event(SystemEvent.INIT.value, detail={"logger": logger})
-    )
+    pygame.event.post(pygame.event.Event(SystemEvent.INIT.value))
 
     tasks = []
 
