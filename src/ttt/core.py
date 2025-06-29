@@ -2,9 +2,11 @@ import asyncio
 from abc import ABC
 from collections.abc import Awaitable, Coroutine, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
+from time import monotonic_ns
 from typing import Any, Callable
+from uuid import UUID, uuid4
 
 import pygame
 import structlog
@@ -37,6 +39,7 @@ class Eventable:
 class Element(Eventable):
     # the bounding box
     position: pygame.Rect | None = None
+    id: UUID = field(default_factory=lambda: uuid4())
 
     events: tuple[Event, ...] = tuple()
 
@@ -90,8 +93,9 @@ class Application(Eventable):
     screen: pygame.Surface = pygame.Surface((0, 0))
     state: frozendict[str, frozendict[str, Any]] = frozendict()
     clock: pygame.time.Clock = pygame.time.Clock()
+    start: int = field(default_factory=monotonic_ns)
 
-    elements: tuple[Element, ...] = tuple()
+    elements: frozendict[str, Element] = frozendict()
 
     delta_data: asyncio.Queue[DeltaOperation] = asyncio.Queue()
     delta_screen: asyncio.Queue[Element] = asyncio.Queue()
@@ -119,7 +123,7 @@ def dispatch_application_handler(
 
 
 def dispatch_element_handler(
-    elements: tuple[Element, ...],
+    elements: Sequence[Element],
     event: pygame.event.Event,
     application: Application,
     logger: BoundLogger,
@@ -155,6 +159,14 @@ async def events_dispatch(
     logger: BoundLogger,
 ) -> None:
     for event in events:
+        target = (
+            application.elements[str(event.detail["_target"])]
+            if hasattr(event, "detail")
+            and isinstance(event.detail, dict)
+            and isinstance(event.detail.get("_target"), UUID)
+            else None
+        )
+
         match event.type:
             case pygame.QUIT:
                 application.exit_event.set()
@@ -162,17 +174,25 @@ async def events_dispatch(
             case pygame.MOUSEBUTTONDOWN:
                 dispatch_application_handler(application, event, logger)
                 dispatch_element_handler(
-                    application.elements,
+                    tuple(application.elements.values()),
                     event,
                     application,
                     logger,
                     check_is_collide,
                 )
 
+            case custom if target and custom >= pygame.USEREVENT:
+                dispatch_element_handler(
+                    (target,),
+                    event,
+                    application,
+                    logger,
+                )
+
             case custom if custom >= pygame.USEREVENT:
                 dispatch_application_handler(application, event, logger)
                 dispatch_element_handler(
-                    application.elements,
+                    tuple(application.elements.values()),
                     event,
                     application,
                     logger,
@@ -187,11 +207,8 @@ async def coroutine_loop(
 ) -> None:
     with suppress(asyncio.CancelledError):
         while True:
-            try:
-                if returns := await func(*args):
-                    args = returns
-            except Exception as e:
-                print(e)
+            if returns := await func(*args):
+                args = returns
 
             await asyncio.sleep(0)
 
@@ -241,10 +258,36 @@ async def application_refresh(application: Application) -> Application:
             field = application_get_field(application, delta.field)
 
             match delta:
+                case DeltaAdd() if isinstance(delta.item, Element):
+                    result = replace(
+                        result,
+                        **{
+                            field: frozendict(
+                                {
+                                    **getattr(result, field),
+                                    **{str(delta.item.id): delta.item},
+                                },
+                            )
+                        },
+                    )
+
                 case DeltaAdd():
                     result = replace(
                         result,
                         **{field: getattr(result, field) + (delta.item,)},
+                    )
+
+                case DeltaUpdate() if isinstance(delta.item, Element):
+                    result = replace(
+                        result,
+                        **{
+                            field: frozendict(
+                                {
+                                    **getattr(result, field),
+                                    **{str(delta.item.id): delta.new},
+                                },
+                            )
+                        },
                     )
 
                 case DeltaUpdate():
@@ -254,6 +297,20 @@ async def application_refresh(application: Application) -> Application:
                             field: tuple(
                                 delta.new if item == delta.item else item
                                 for item in getattr(result, field)
+                            )
+                        },
+                    )
+
+                case DeltaDelete() if isinstance(delta.item, Element):
+                    result = replace(
+                        result,
+                        **{
+                            field: frozendict(
+                                **{
+                                    id: item
+                                    for id, item in getattr(result, field).items()
+                                    if not item == delta.item
+                                }
                             )
                         },
                     )
@@ -368,6 +425,46 @@ async def add_event_listener(
             raise Exception("Unhandled event registration")
 
     return result
+
+
+async def add_event_listeners(
+    target: Eventable,
+    listeners: Sequence[tuple[int, Callable[..., Coroutine[None, None, None]]]],
+) -> Eventable:
+    result = target
+
+    for kind, handler in listeners:
+        result = await add_event_listener(result, kind, handler)
+
+    return result
+
+
+async def dispatch_event(target: Element, kind: int, **detail: Any):
+    pygame.event.post(pygame.event.Event(kind, detail=dict(detail, _target=target.id)))
+
+
+async def set_timeout(
+    application: Application, delay: int, awaitable: Coroutine[None, None, None]
+):
+    start = monotonic_ns()
+
+    async def handler(
+        event: pygame.event.Event,
+        application: Application,
+        logger: BoundLogger,
+        **detail: Any,
+    ):
+        if monotonic_ns() - start >= (delay * 1_000_000):
+            asyncio.create_task(awaitable)
+
+            await application.delta_data.put(
+                DeltaDelete(ApplicationDataField.EVENTS, event)
+            )
+
+    event = Event(SystemEvent.REFRESH.value, handler)
+
+    # add this event
+    await application.delta_data.put(DeltaAdd(ApplicationDataField.EVENTS, event))
 
 
 async def screen_update(application: Application, element: Element) -> Application:
